@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>BTC Balance Watcher</title>
+  <style>
+    body{font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial; margin:20px; background:#f6f8fa; color:#111}
+    h1{margin:0 0 8px}
+    .card{background:#fff;border-radius:10px;box-shadow:0 6px 18px rgba(20,30,50,0.06);padding:14px;margin-bottom:12px}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:10px;text-align:left;border-bottom:1px solid #f1f3f5;font-size:0.95rem}
+    th{color:#555;font-weight:600}
+    .addr{font-family:monospace;font-size:0.9rem;word-break:break-all}
+    .small{font-size:0.85rem;color:#666}
+    .delta-up{color:#0b6b2f;font-weight:700}
+    .delta-none{color:#888}
+    .controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+    button{background:#0366d6;color:#fff;border:0;padding:8px 12px;border-radius:8px;cursor:pointer}
+    button:active{transform:translateY(1px)}
+    .btn-ghost{background:#fff;border:1px solid #dfe7ef;color:#0366d6}
+    .notif{padding:10px;border-radius:8px;margin-bottom:12px}
+    .notif.warn{background:#fff9e6;border:1px solid #ffe4a3}
+    .link{color:#0366d6;text-decoration:none}
+    .muted{color:#7d8590}
+    .status{font-size:0.9rem}
+    .highlight{background:linear-gradient(90deg,#e6ffef,#fff);border-radius:6px;padding:6px}
+  </style>
+</head>
+<body>
+  <h1>BTC Balance Watcher</h1>
+
+  <div class="card">
+    <div class="controls">
+      <button id="refreshBtn">Refresh sekarang</button>
+      <button class="btn-ghost" id="togglePolling">Jeda Polling</button>
+      <label class="small">Interval:
+        <select id="intervalSelect">
+          <option value="30">30s</option>
+          <option value="60" selected>60s</option>
+          <option value="120">120s</option>
+          <option value="300">5m</option>
+        </select>
+      </label>
+      <div style="margin-left:auto" class="status">
+        Last: <span id="lastUpdated" class="muted">-</span>
+      </div>
+    </div>
+
+    <div id="notice" class="notif warn" style="display:none"></div>
+
+    <table id="balancesTable" class="card">
+      <thead>
+        <tr>
+          <th>Address</th>
+          <th>Saldo (BTC)</th>
+          <th>Delta</th>
+          <th class="small">Explorer</th>
+        </tr>
+      </thead>
+      <tbody id="tableBody"></tbody>
+    </table>
+
+    <div class="small muted">
+      Catatan: Halaman ini memanggil API publik untuk mengambil data alamat. Jika browser Anda blokir request karena CORS, jalankan file ini melalui server lokal:
+      <pre>python -m http.server 8000</pre>
+      lalu buka <code>http://localhost:8000/btc_balances.html</code>
+    </div>
+  </div>
+
+<script>
+(() => {
+  // ================= CONFIG =================
+  const ADDRESSES = [
+    "1EHNa6Q4Jz2uvNExL497mE43ikXhwF6kZm",
+    "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
+    "1LagHJk2FyCV2VzrNHVqg3gYG4TSYwDV4m",
+    "1cMh228HTCiwS8ZsaakH8A8wze1JR5ZsP"
+  ];
+  const BLOCKSTREAM_API_BASE = "https://blockstream.info/api"; // mainnet
+  const STORAGE_KEY = "btc_balances_state_v1";
+  // ==========================================
+
+  const tableBody = document.getElementById("tableBody");
+  const lastUpdatedEl = document.getElementById("lastUpdated");
+  const refreshBtn = document.getElementById("refreshBtn");
+  const togglePollingBtn = document.getElementById("togglePolling");
+  const intervalSelect = document.getElementById("intervalSelect");
+  const notice = document.getElementById("notice");
+
+  let polling = true;
+  let pollTimer = null;
+
+  function satsToBtc(sats) {
+    return (Number(sats) / 100000000).toFixed(8);
+  }
+
+  function loadState() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      return raw ? JSON.parse(raw) : {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  function saveState(obj) {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(obj)); } catch(e){}
+  }
+
+  function explorerLink(addr) {
+    return `https://blockstream.info/address/${addr}`;
+  }
+
+  function makeRow(addr, btcStr, deltaStr, deltaClass) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td class="addr"><span>${addr}</span></td>
+      <td><strong>${btcStr}</strong></td>
+      <td class="${deltaClass}">${deltaStr}</td>
+      <td><a class="link" target="_blank" rel="noopener" href="${explorerLink(addr)}">Open</a></td>
+    `;
+    return tr;
+  }
+
+  async function fetchAddressBalanceSats(addr) {
+    // Use Blockstream API: /api/address/{address}
+    const url = `${BLOCKSTREAM_API_BASE}/address/${encodeURIComponent(addr)}`;
+    const resp = await fetch(url, { cache: "no-store" });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const j = await resp.json();
+    const cs = j.chain_stats || {};
+    const funded = Number(cs.funded_txo_sum || 0);
+    const spent = Number(cs.spent_txo_sum || 0);
+    const balance = funded - spent;
+    return balance | 0;
+  }
+
+  function showNotice(text) {
+    notice.style.display = "block";
+    notice.textContent = text;
+    setTimeout(()=> {
+      notice.style.display = "none";
+    }, 8000);
+  }
+
+  function doBrowserNotify(title, body) {
+    if (!("Notification" in window)) return;
+    if (Notification.permission === "granted") {
+      new Notification(title, { body });
+    } else if (Notification.permission !== "denied") {
+      Notification.requestPermission().then(p => {
+        if (p === "granted") new Notification(title, { body });
+      });
+    }
+  }
+
+  async function updateBalances() {
+    refreshBtn.disabled = true;
+    refreshBtn.textContent = "Memeriksa...";
+    const state = loadState();
+    const newState = Object.assign({}, state);
+    const rows = [];
+
+    for (const addr of ADDRESSES) {
+      try {
+        const sats = await fetchAddressBalanceSats(addr);
+        const prevSats = Number(state[addr] || 0);
+        newState[addr] = sats;
+
+        const btcStr = satsToBtc(sats);
+        let deltaStr = "—";
+        let deltaClass = "delta-none";
+
+        if (prevSats === 0 && state[addr] !== undefined) {
+          // had stored 0 previously (explicit), show as none
+          deltaStr = "0.00000000";
+          deltaClass = "delta-none";
+        } else if (prevSats === 0 && state[addr] === undefined) {
+          // first run for this address
+          deltaStr = "(init)";
+          deltaClass = "delta-none";
+        } else {
+          const d = sats - prevSats;
+          if (d > 0) {
+            deltaStr = "+" + satsToBtc(d);
+            deltaClass = "delta-up";
+            // Visual highlight + notification
+            showNotice(`BTC masuk ke ${addr}: +${satsToBtc(d)} BTC`);
+            doBrowserNotify("BTC masuk", `${addr}\n+${satsToBtc(d)} BTC`);
+          } else if (d < 0) {
+            deltaStr = satsToBtc(d);
+            deltaClass = "delta-none";
+          } else {
+            deltaStr = "0.00000000";
+            deltaClass = "delta-none";
+          }
+        }
+
+        rows.push({ addr, btcStr, deltaStr, deltaClass });
+      } catch (err) {
+        rows.push({ addr, btcStr: "error", deltaStr: err.message || "err", deltaClass: "delta-none" });
+      }
+    }
+
+    // render table
+    tableBody.innerHTML = "";
+    for (const r of rows) {
+      tableBody.appendChild(makeRow(r.addr, r.btcStr, r.deltaStr, r.deltaClass));
+    }
+
+    const now = new Date();
+    lastUpdatedEl.textContent = now.toLocaleString();
+    saveState(newState);
+
+    refreshBtn.disabled = false;
+    refreshBtn.textContent = "Refresh sekarang";
+  }
+
+  function startPolling() {
+    stopPolling();
+    const intervalSec = Math.max(10, Number(intervalSelect.value) || 60);
+    pollTimer = setInterval(() => {
+      if (polling) updateBalances().catch(e => console.error(e));
+    }, intervalSec * 1000);
+    // do immediate run
+    updateBalances().catch(e => console.error(e));
+    togglePollingBtn.textContent = "Jeda Polling";
+    polling = true;
+  }
+
+  function stopPolling() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    togglePollingBtn.textContent = "Lanjutkan Polling";
+    polling = false;
+  }
+
+  // init
+  refreshBtn.addEventListener("click", () => updateBalances().catch(e => {
+    console.error(e);
+    showNotice("Gagal memeriksa: " + (e.message || e));
+  }));
+
+  togglePollingBtn.addEventListener("click", () => {
+    if (polling) stopPolling(); else startPolling();
+  });
+
+  intervalSelect.addEventListener("change", () => {
+    startPolling();
+  });
+
+  // On load: render stored state first (fast)
+  (function renderStored() {
+    const st = loadState();
+    tableBody.innerHTML = "";
+    for (const addr of ADDRESSES) {
+      const prev = st[addr] || 0;
+      tableBody.appendChild(makeRow(addr, prev ? satsToBtc(prev) : "-", prev ? "saved" : "(init)", prev ? "delta-none" : "delta-none"));
+    }
+    lastUpdatedEl.textContent = st.__last || "-";
+  })();
+
+  // Start polling
+  startPolling();
+
+  // Request notification permission proactively (optional)
+  if ("Notification" in window && Notification.permission === "default") {
+    try { Notification.requestPermission(); } catch(e) {}
+  }
+
+})();
+</script>
+</body>
+</html>
